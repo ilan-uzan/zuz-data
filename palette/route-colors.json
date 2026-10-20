@@ -1,0 +1,44 @@
+{
+  "mode.train": {
+    "light": "#1D4F91"
+  },
+  "line.tlv.red": {
+    "light": "#E1251B"
+  },
+  "line.jlm.red": {
+    "light": "#D7282F"
+  },
+  "mode.lightRail": {
+    "light": "#7A3E9D"
+  },
+  "mode.sherut": {
+    "light": "#F2B705"
+  },
+  "line.dan": {
+    "light": "#0072BC"
+  },
+  "mode.bus": {
+    "light": "#0E7C47"
+  },
+  "mode.brt": {
+    "light": "#B8326E"
+  },
+  "mode.bike": {
+    "light": "#0A7EA4"
+  },
+  "region.negevDune.rust": {
+    "light": "#A8502A"
+  },
+  "region.galileeGreen": {
+    "light": "#5B8C3E"
+  },
+  "region.telAvivSea": {
+    "light": "#1E8FC6"
+  },
+  "brand.flagBlue": {
+    "light": "#0038B8"
+  },
+  "region.shabbatDusk": {
+    "light": "#3B3F6B"
+  }
+}

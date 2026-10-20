@@ -1,0 +1,137 @@
+# Nightly timetable build: MoT GTFS -> zuz-tt.bin.xz + zuz-shapes.bin.xz + manifest.json,
+# published as a GitHub release. The app reads
+#   https://github.com/ilan-uzan/zuz-data/releases/latest/download/manifest.json
+# and downloads the files from the tag-pinned URLs inside it.
+name: Nightly dataset
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Publish even if the GTFS feed has not changed since the latest release
+        type: boolean
+        default: false
+  schedule:
+    # 22:30 UTC ≈ 01:30 Israel, after MoT publishes the day's feed (~19:45 Israel).
+    - cron: "30 22 * * *"
+  pull_request:
+
+permissions:
+  contents: write   # create and delete releases
+  actions: write    # keep the schedule enabled (see the last step)
+
+concurrency:
+  group: dataset
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install numpy
+        run: python -m pip install "numpy>=2,<3"
+
+      - name: Script tests
+        run: python -I -m unittest discover -s pipeline/tests -v
+
+      - name: Download the GTFS feed
+        # HEAD lies on gtfs.mot.gov.il (it returns a small HTML page), so always GET and check the size.
+        run: |
+          mkdir -p feed
+          curl -fsSL --retry 3 -o feed/gtfs.zip https://gtfs.mot.gov.il/gtfsfiles/israel-public-transportation.zip \
+            || curl -fsSL --retry 3 -o feed/gtfs.zip "https://files.mobilitydatabase.org/mdb-2519/latest.zip"
+          test "$(stat -c %s feed/gtfs.zip)" -gt 50000000
+          ls -l feed/gtfs.zip
+
+      - name: Compare with the latest release
+        id: feed
+        run: |
+          sha="$(sha256sum feed/gtfs.zip | cut -d' ' -f1)"
+          previous="$(gh release download --repo "$GITHUB_REPOSITORY" --pattern manifest.json --output - 2>/dev/null \
+            | python -I -c 'import json, sys; print(json.load(sys.stdin).get("feedSha256", ""))' || true)"
+          echo "feed sha256 $sha, latest release built from ${previous:-nothing}"
+          if [ "$sha" = "$previous" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::The GTFS feed is unchanged since the latest release; nothing to publish."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the dataset
+        if: steps.feed.outputs.changed == 'true' || github.event_name == 'pull_request'
+        run: python -I pipeline/build_dataset.py feed/gtfs.zip out
+
+      - name: Dataset tests
+        if: steps.feed.outputs.changed == 'true' || github.event_name == 'pull_request'
+        run: |
+          mkdir -p feed/gtfs && unzip -q -o feed/gtfs.zip fare_attributes.txt fare_rules.txt -d feed/gtfs
+          ZUZ_DATASET=out ZUZ_GTFS=feed/gtfs python -I -m unittest discover -s pipeline/tests -v
+
+      - name: Finalize the manifest
+        id: manifest
+        if: steps.feed.outputs.changed == 'true' || github.event_name == 'pull_request'
+        run: |
+          tag="$(python -I scripts/finalize_manifest.py out/manifest.json "$GITHUB_REPOSITORY" feed/gtfs.zip)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          ls -l out/*.xz out/manifest.json
+          for f in out/zuz-tt.bin.xz out/zuz-shapes.bin.xz; do test "$(stat -c %s "$f")" -gt 500000; done
+
+      - name: Publish the release
+        if: steps.feed.outputs.changed == 'true' && github.event_name != 'pull_request'
+        env:
+          TAG: ${{ steps.manifest.outputs.tag }}
+        run: |
+          read -r from to <<<"$(python -I -c 'import json; m = json.load(open("out/manifest.json")); print(m["validFrom"], m["validTo"])')"
+          notes="Zuz timetable built from the Israel Ministry of Transport GTFS feed (gtfs.mot.gov.il), valid ${from} to ${to}.
+          Source data: Israel Ministry of Transport. See the README for attribution and terms."
+          # A draft is invisible to releases/latest, so clients never see a release whose assets are still uploading.
+          gh release create "$TAG" out/zuz-tt.bin.xz out/zuz-shapes.bin.xz out/manifest.json \
+            --draft --title "$TAG" --notes "$notes" --target "$GITHUB_SHA"
+          gh release edit "$TAG" --draft=false --latest
+
+      - name: Verify the stable URL
+        if: steps.feed.outputs.changed == 'true' && github.event_name != 'pull_request'
+        env:
+          TAG: ${{ steps.manifest.outputs.tag }}
+        run: |
+          mkdir -p check
+          for attempt in 1 2 3 4 5 6; do
+            curl -fsSL -o check/manifest.json "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/manifest.json" \
+              && python -I -c 'import json, sys; sys.exit(json.load(open("check/manifest.json"))["version"] != sys.argv[1])' "$TAG" \
+              && break
+            echo "latest is not $TAG yet; retrying"; sleep 10
+          done
+          cmp check/manifest.json out/manifest.json
+          python -I - <<'EOF'
+          import hashlib, json, urllib.request
+          m = json.load(open("check/manifest.json"))
+          for f in m["files"].values():
+              data = urllib.request.urlopen(f["url"], timeout=60).read()
+              assert len(data) == f["bytes"] and hashlib.sha256(data).hexdigest() == f["sha256"], f["file"]
+              print("ok", f["url"], len(data))
+          EOF
+
+      - name: Prune old releases
+        if: steps.feed.outputs.changed == 'true' && github.event_name != 'pull_request'
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt,isDraft \
+            | python -I scripts/prune_releases.py 7 3 \
+            | while read -r tag; do
+                echo "deleting $tag"
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+              done
+
+      - name: Keep the schedule enabled
+        # GitHub disables scheduled workflows after 60 days without repository activity.
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/nightly.yml/enable"
